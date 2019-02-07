@@ -43,6 +43,9 @@
 
 bool WorldSession::ProcessChatMessageAfterSecurityCheck(std::string& msg, uint32 lang, uint32 msgType)
 {
+    if (!IsLanguageAllowedForChatType(lang, msgType))
+        return false;
+
     if (lang != LANG_ADDON)
     {
         // strip invisible characters for non-addon messages
@@ -59,12 +62,75 @@ bool WorldSession::ProcessChatMessageAfterSecurityCheck(std::string& msg, uint32
             return false;
         }
     }
+
     ChatHandler handler(this);
 
     if (handler.ParseCommands(msg.c_str()))
         return false;
 
     return true;
+}
+
+bool WorldSession::IsLanguageAllowedForChatType(uint32 lang, uint32 msgType)
+{
+    // Right now we'll just restrict addon language to the appropriate chat types
+    // Anything else is OK (default previous behaviour)
+    switch (lang)
+    {
+        case LANG_ADDON:
+        {
+            switch (msgType)
+            {
+                case CHAT_MSG_PARTY:
+                case CHAT_MSG_GUILD:
+                case CHAT_MSG_OFFICER:
+                case CHAT_MSG_RAID:
+                case CHAT_MSG_RAID_LEADER:
+                case CHAT_MSG_RAID_WARNING:
+                case CHAT_MSG_BATTLEGROUND:
+                case CHAT_MSG_BATTLEGROUND_LEADER:
+                case CHAT_MSG_CHANNEL:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+        default:
+            return true;
+    }
+
+    return true;
+}
+
+uint32_t WorldSession::ChatCooldown()
+{
+    ASSERT(GetPlayer());
+
+    auto cooldown = sWorld.getConfig(CONFIG_UINT32_WORLD_CHAN_CD);
+    const auto minLevel = sWorld.getConfig(CONFIG_UINT32_WORLD_CHAN_MIN_LEVEL);
+    const auto cooldownMaxLvl = sWorld.getConfig(CONFIG_UINT32_WORLD_CHAN_CD_MAX_LEVEL);
+    const auto cooldownScaling = sWorld.getConfig(CONFIG_UINT32_WORLD_CHAN_CD_SCALING);
+    const auto cooldownUseAcctLvl = sWorld.getConfig(CONFIG_UINT32_WORLD_CHAN_CD_USE_ACCOUNT_MAX_LEVEL);
+    const auto playerLevel = cooldownUseAcctLvl? GetAccountMaxLevel() : GetPlayer()->getLevel();
+
+    if (cooldown && cooldownMaxLvl > playerLevel)
+    {
+        const auto currTime = time(NULL);
+        const auto delta = currTime - GetLastPubChanMsgTime();
+
+        if (cooldownScaling)
+        {
+            auto factor = static_cast<double>((cooldownMaxLvl - playerLevel)) / (cooldownMaxLvl - minLevel);
+            cooldown *= factor;
+        }
+
+        if (delta < cooldown)
+        {
+            return cooldown - delta;
+        }
+    }
+
+    return 0;
 }
 
 void WorldSession::HandleMessagechatOpcode(WorldPacket & recv_data)
@@ -145,9 +211,11 @@ void WorldSession::HandleMessagechatOpcode(WorldPacket & recv_data)
 
         if (type != CHAT_MSG_AFK && type != CHAT_MSG_DND)
         {
-            if (m_muteTime > time(NULL)) // Muted
+            auto currTime = time(NULL);
+
+            if (m_muteTime > currTime) // Muted
             {
-                std::string timeStr = secsToTimeString(m_muteTime - time(NULL));
+                std::string timeStr = secsToTimeString(m_muteTime - currTime);
                 SendNotification(GetMangosString(LANG_WAIT_BEFORE_SPEAKING), timeStr.c_str());
                 return;
             }
@@ -256,9 +324,18 @@ void WorldSession::HandleMessagechatOpcode(WorldPacket & recv_data)
                                 }
                             }
                         }
+
+                        if (auto cooldown = ChatCooldown())
+                        {
+                            ChatHandler(this).PSendSysMessage(
+                                "Please wait %u seconds before sending another message.", cooldown
+                            );
+                            return;
+                        }
                     }
 
                     chn->Say(playerPointer->GetObjectGuid(), msg.c_str(), lang);
+                    SetLastPubChanMsgTime(time(NULL));
 
                     if (lang != LANG_ADDON && chn->HasFlag(Channel::ChannelFlags::CHANNEL_FLAG_GENERAL))
                         if (AntispamInterface *a = sAnticheatLib->GetAntispam())
